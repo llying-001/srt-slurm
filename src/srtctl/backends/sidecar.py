@@ -4,6 +4,7 @@
 """Shared helpers for lifecycle-coupled native engine and Dynamo sidecars."""
 
 import shlex
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,6 +33,21 @@ def sidecar_grpc_port(process: "Process") -> int:
             "the topology was built without dynamo_sidecar=True"
         )
     return process.sidecar_grpc_port
+
+
+def run_with_model_link(command: list[str], *, workdir: str, name: str, model_path: str) -> list[str]:
+    """Run ``command`` from ``workdir``, where the relative path ``name`` links to ``model_path``.
+
+    A sidecar without a served-name flag registers under its literal
+    ``--model-path`` and reads tokenizer artifacts from it when that path exists.
+    Passing ``name`` as a relative path that resolves to the mounted model gives
+    the registration the served name while the artifacts stay local.
+    """
+    parts = name.split("/")
+    if PurePosixPath(name).is_absolute() or any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"served model name {name!r} must be a relative path without '.' or '..' components")
+    script = 'mkdir -p "$(dirname "$1/$3")" && ln -sfn "$2" "$1/$3" && cd "$1" && shift 3 && exec "$@"'
+    return ["bash", "-c", script, "srtctl-sidecar", workdir, model_path, name, *command]
 
 
 def build_sidecar_launch_command(
