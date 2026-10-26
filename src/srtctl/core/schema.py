@@ -413,6 +413,8 @@ class ClusterConfig:
     default_sbatch_directives: dict[str, str] | None = None
     # `health_check` block (`max_attempts`, `interval_seconds`) used when a recipe has none.
     default_health_check: dict[str, int] | None = None
+    # Default for recipe `reuse_container`; explicit true or false in the recipe wins.
+    default_reuse_container: bool = False
     # srtctl checkout on the shared filesystem that compute nodes mount at /srtctl-src. Default: this checkout.
     srtctl_root: str | None = None
     output_dir: str | None = None  # Custom output directory for job logs
@@ -2397,6 +2399,10 @@ def _serialize_node_install(install_cmd: str) -> str:
     hash-pinned source install nests on the /configs cache lock inside a
     subshell. Distinct FDs keep the two node-local and cross-node locks
     independent and refactor-proof even if that inner subshell is removed.
+
+    With ``reuse_container: true``, worker and frontend steps using the same
+    image and root-remap mode also share this lock and sentinel, so later steps
+    skip an installation that another step already completed on the node.
     """
     # Resolve the env dir at runtime; fall back to $HOME (also container-private)
     # if python3 is somehow unavailable before the install runs.
@@ -2816,6 +2822,9 @@ class SrtConfig:
     ] = field(default_factory=dict)
     # Extra mounts as `host:container[:ro]` strings; `$VARS` expand, `{placeholders}` do not.
     extra_mount: tuple[str, ...] | None = None
+    # Reuse a named Pyxis container per image and root-remap mode on each node of this job,
+    # avoiding repeated root filesystem extraction into host RAM. Off by default.
+    reuse_container: bool = False
     # Extra srun options (`key: value` -> `--key=value`; empty value -> `--key`) for every job step.
     srun_options: dict[str, str] = field(default_factory=dict)
     # Extra `#SBATCH --key=value` lines (empty value -> `--key`); wins over the cluster defaults.
@@ -4178,3 +4187,10 @@ def installs_dynamo(config: SrtConfig) -> bool:
     dynamo frontend is selected and install isn't disabled.
     """
     return config.frontend.type == "dynamo" and config.dynamo.install
+
+
+def container_creation_env(config: SrtConfig) -> dict[str, str] | None:
+    """Creation-time environment for workers and the Dynamo frontend."""
+    from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT
+
+    return dict(CONTAINER_REMAP_ROOT_EXPORT) if installs_dynamo(config) else None

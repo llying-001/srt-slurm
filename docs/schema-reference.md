@@ -28,6 +28,7 @@ Top-level keys of a recipe YAML.
 | `environment` | dict[str, str] | `{}` | Environment variables for every worker; applied after `roles.<role>.env`, so a key set in both takes this value. Values may use `{node}` and `{node_id}`. |
 | `container_mounts` | dict[[FormattablePath](#formattablepath), [FormattablePath](#formattablepath)] | `{}` | Host path -> container path mounts for every container; both sides are FormattablePaths. |
 | `extra_mount` | tuple[str, ...] \| None | `None` | Extra mounts as `host:container[:ro]` strings; `$VARS` expand, `{placeholders}` do not. |
+| `reuse_container` | bool | `False` | Reuse a named Pyxis container per image and root-remap mode on each node of this job, avoiding repeated root filesystem extraction into host RAM. Off by default. |
 | `srun_options` | dict[str, str] | `{}` | Extra srun options (`key: value` -> `--key=value`; empty value -> `--key`) for every job step. |
 | `sbatch_directives` | dict[str, str] | `{}` | Extra `#SBATCH --key=value` lines (empty value -> `--key`); wins over the cluster defaults. |
 | `enable_config_dump` | bool | `True` | Accepted for compatibility; srtctl does not read it. Workers dump their config where the engine supports it. |
@@ -813,6 +814,7 @@ Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve al
 | `use_het_jobs` | bool | `False` | Default for ``ResourceConfig.het_jobs`` when the recipe doesn't set it. When True (and recipe doesn't override), the prefill side and decode side are submitted as two SLURM heterogeneous-job components, each with its own ``--segment``. Lets asymmetric layouts (e.g. prefill 12 + decode 10 nodes on GB200/GB300) preserve NVL72 affinity per side. |
 | `default_sbatch_directives` | dict[str, str] \| None | `None` | Extra `#SBATCH --key=value` lines added to every job; a recipe's `sbatch_directives` wins per key. |
 | `default_health_check` | dict[str, int] \| None | `None` | `health_check` block (`max_attempts`, `interval_seconds`) used when a recipe has none. |
+| `default_reuse_container` | bool | `False` | Default for recipe `reuse_container`; explicit true or false in the recipe wins. |
 | `srtctl_root` | str \| None | `None` | srtctl checkout on the shared filesystem that compute nodes mount at /srtctl-src. Default: this checkout. |
 | `output_dir` | str \| None | `None` | Custom output directory for job logs |
 | `model_paths` | dict[str, str] \| None | `None` | Alias -> path map; a recipe's `model.path` may name an alias instead of a path. |

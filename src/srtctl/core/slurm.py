@@ -11,12 +11,18 @@ This module consolidates all SLURM-related functionality:
 - Container utilities: get_container_mounts_str
 """
 
+import hashlib
 import logging
 import os
 import shlex
 import socket
 import subprocess
+import threading
+import time
+from _thread import LockType
 from collections.abc import Sequence
+from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 
 from .ip_utils import get_node_ip
@@ -180,6 +186,140 @@ def get_node_ips(
 # never parses it, so an unsupporting cluster no-ops instead of failing the step.
 CONTAINER_REMAP_ROOT_EXPORT = {"ENROOT_REMAP_ROOT": "yes"}
 
+DEFAULT_CONTAINER_PREPARE_TIMEOUT_SECONDS = 1800.0
+_CONTAINER_PREPARE_GUARD = threading.Lock()
+_CONTAINER_PREPARE_LOCKS: dict[tuple[str, str], LockType] = {}
+_PREPARED_CONTAINER_NODES: set[tuple[str, str]] = set()
+_FAILED_CONTAINER_NODES: dict[tuple[str, str], str] = {}
+
+
+@dataclass(frozen=True)
+class ContainerName:
+    """A resolved Pyxis name and whether srtctl owns its preparation."""
+
+    name: str | None
+    prepare: bool = False
+
+
+def _prepare_shared_container(
+    *,
+    image: str | Path,
+    name: str,
+    nodes: Sequence[str] | None,
+    output: str | None,
+    mounts: dict[Path, Path] | None,
+    options: dict[str, str] | None,
+    export_env: dict[str, str] | None,
+    het_group: int | None,
+    step_name: str | None,
+    timeout_seconds: float | None = None,
+) -> None:
+    """Prepare missing rootfs copies together; only overlapping names/nodes wait."""
+    keys = [(name, node) for node in sorted(set(nodes or ("",)))]
+    timeout = DEFAULT_CONTAINER_PREPARE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    deadline = time.monotonic() + timeout
+    with _CONTAINER_PREPARE_GUARD:
+        locks = [_CONTAINER_PREPARE_LOCKS.setdefault(key, threading.Lock()) for key in keys]
+    try:
+        with ExitStack() as stack:
+            # Stable acquisition order also handles partially overlapping node sets.
+            for lock in locks:
+                if not lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                    raise TimeoutError("timed out waiting for another container preparation")
+                stack.callback(lock.release)
+            for key in keys:
+                if key in _FAILED_CONTAINER_NODES:
+                    raise OSError(f"previous preparation failed: {_FAILED_CONTAINER_NODES[key]}")
+            pending = [key for key in keys if key not in _PREPARED_CONTAINER_NODES]
+            if not pending:
+                return
+            # Preparation needs one task per node, independent of the worker's
+            # MPI rank layout. Reuse the normal launcher for all other options.
+            prep_options = {
+                key: value
+                for key, value in (options or {}).items()
+                if key not in {"distribution", "nodes", "ntasks", "ntasks-per-node", "nodelist", "job-name"}
+            }
+            prep_options.update({"container-name": name, "ntasks-per-node": "1"})
+            try:
+                proc = start_srun_process(
+                    ["true"],
+                    nodes=len(pending),
+                    ntasks=len(pending),
+                    nodelist=[node for _, node in pending] if nodes else None,
+                    output=output,
+                    container_image=image,
+                    container_mounts=mounts,
+                    srun_options=prep_options,
+                    srun_export_env=export_env,
+                    het_group=het_group,
+                    step_name=f"{step_name or 'srtctl'}.container-prepare",
+                    use_bash_wrapper=False,
+                )
+                try:
+                    proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                    raise
+                if proc.returncode:
+                    raise subprocess.CalledProcessError(proc.returncode, proc.args)
+            except (subprocess.SubprocessError, OSError) as exc:
+                # A failed extraction may leave a partial rootfs. Waiting launches
+                # must fail too rather than treating its existence as success.
+                _FAILED_CONTAINER_NODES.update({key: str(exc) for key in pending})
+                raise
+            # Without an explicit node list, Slurm may select a different node
+            # next time, so that placement cannot be cached.
+            if nodes:
+                _PREPARED_CONTAINER_NODES.update(pending)
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise RuntimeError(
+            f"Container preparation failed for step {step_name or '<unnamed>'}, image {image}, "
+            f"nodes {','.join(nodes) if nodes else '<Slurm-selected>'}; log: {output or '<orchestrator output>'}: {exc}"
+        ) from exc
+
+
+def shared_container_name(container_image: str | Path, *, remap_root: bool = False, job_id: str | None = None) -> str:
+    """Name a job's shared image rootfs, separating incompatible root-remap modes.
+
+    Adapted from srt-slurm PR #484 (318c460f7846e396a03f701acfd97f67e24ded45).
+    The job ID prevents concurrent jobs from attaching to each other's rootfs;
+    cleanup of named containers depends on the cluster's Pyxis container scope.
+    """
+    key = f"{container_image}|remap_root" if remap_root else str(container_image)
+    digest = hashlib.sha1(key.encode()).hexdigest()[:12]
+    return f"srtctl_{digest}_{job_id or get_slurm_job_id() or 'nojob'}"
+
+
+def resolve_container_name(
+    container_image: str | Path | None,
+    *,
+    reuse_container: bool = False,
+    srun_options: dict[str, str] | None = None,
+    srun_export_env: dict[str, str] | None = None,
+    job_id: str | None = None,
+) -> ContainerName:
+    """Resolve an explicit name or the opt-in job/image name used by every launch."""
+    if not container_image:
+        return ContainerName(None)
+    options = srun_options or {}
+    explicit_name = options.get("container-name")
+    if explicit_name:
+        return ContainerName(explicit_name)
+    if not reuse_container:
+        return ContainerName(None)
+    remap_value = (srun_export_env or {}).get("ENROOT_REMAP_ROOT", os.environ.get("ENROOT_REMAP_ROOT", "no"))
+    remap_root = remap_value.lower() in {"1", "yes", "true", "y"}
+    if "container-remap-root" in options:
+        remap_root = True
+    if "no-container-remap-root" in options:
+        remap_root = False
+    # Share the rootfs while giving each step its own mounts and namespaces.
+    return ContainerName(
+        f"{shared_container_name(container_image, remap_root=remap_root, job_id=job_id)}:no_exec", True
+    )
+
 
 def start_srun_process(
     command: list[str],
@@ -189,8 +329,11 @@ def start_srun_process(
     cpus_per_task: int | None = None,
     nodelist: Sequence[str] | None = None,
     output: str | None = None,
-    container_image: str | None = None,
+    container_image: str | Path | None = None,
     container_mounts: dict[Path, Path] | None = None,
+    reuse_container: bool = False,
+    container_prepare_nodes: Sequence[str] | None = None,
+    container_prepare_timeout_seconds: float | None = None,
     env_to_pass_through: list[str] | None = None,
     env_to_set: dict[str, str] | None = None,
     env_to_unset: list[str] | None = None,
@@ -219,6 +362,11 @@ def start_srun_process(
         output: Output file path (optional)
         container_image: Container image path (optional)
         container_mounts: Dict of host_path -> container_path mounts
+        reuse_container: Reuse one named Pyxis rootfs per job/image/remap mode (default: False).
+        container_prepare_nodes: Prepare this image on these nodes together before its first launch.
+            Defaults to nodelist. Later launches reuse the completed preparation.
+        container_prepare_timeout_seconds: Combined preparation and lock-wait budget.
+            Job launches pass their resolved health-check budget; standalone callers default to 30 minutes.
         env_to_pass_through: Environment variable names to pass through
         env_to_set: Environment variables to set (name -> value)
         env_to_unset: Environment variable names to unset before the preamble and command
@@ -294,8 +442,17 @@ def start_srun_process(
         srun_cmd.extend(["--open-mode", "append"])
 
     # Container options
+    resolved_container_name = resolve_container_name(
+        container_image,
+        reuse_container=reuse_container,
+        srun_options=srun_options,
+        srun_export_env=srun_export_env,
+        job_id=slurm_job_id,
+    )
     if container_image:
         srun_cmd.extend(["--container-image", str(container_image)])
+        if resolved_container_name.name:
+            srun_cmd.append(f"--container-name={resolved_container_name.name}")
         srun_cmd.append("--no-container-entrypoint")
         srun_cmd.append("--no-container-mount-home")
 
@@ -305,13 +462,12 @@ def start_srun_process(
 
     if srun_options:
         for key, value in srun_options.items():
+            if key == "container-name" and resolved_container_name.name:
+                continue
             if value:
                 srun_cmd.append(f"--{key}={value}")
             else:
                 srun_cmd.append(f"--{key}")
-
-    if step_name:
-        srun_cmd.append(f"--job-name={step_name}")
 
     # Set env vars in the task environment so the container runtime (enroot/pyxis)
     # sees them at container-creation time. Prefix ALL to preserve srun's normal
@@ -319,6 +475,24 @@ def start_srun_process(
     if srun_export_env:
         exports = ",".join(f"{k}={v}" for k, v in srun_export_env.items())
         srun_cmd.append(f"--export=ALL,{exports}")
+
+    if resolved_container_name.prepare:
+        assert container_image is not None and resolved_container_name.name is not None
+        _prepare_shared_container(
+            image=container_image,
+            name=resolved_container_name.name,
+            nodes=container_prepare_nodes or nodelist,
+            output=output,
+            mounts=container_mounts,
+            options=srun_options,
+            export_env=srun_export_env,
+            het_group=het_group,
+            step_name=step_name,
+            timeout_seconds=container_prepare_timeout_seconds,
+        )
+
+    if step_name:
+        srun_cmd.append(f"--job-name={step_name}")
 
     # Build the actual command to run
     if use_bash_wrapper:

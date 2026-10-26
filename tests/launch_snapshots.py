@@ -56,6 +56,9 @@ _RECORDED_KEYS = (
     "output",
     "container_image",
     "container_mounts",
+    "reuse_container",
+    "container_prepare_nodes",
+    "container_prepare_timeout_seconds",
     "env_to_pass_through",
     "env_to_set",
     "env_to_unset",
@@ -138,6 +141,10 @@ def _render_call(call: dict[str, Any]) -> str:
     lines = [f"## {call.get('step_name') or '<unnamed>'}"]
     for key in _RECORDED_KEYS:
         value = call.get(key)
+        if key == "reuse_container" and not value:
+            continue
+        if key == "container_prepare_timeout_seconds" and not call.get("reuse_container"):
+            continue
         if value is None or value == [] or value == {} or value == ():
             continue
         lines.append(f"{key}:{_render_value(value)}")
