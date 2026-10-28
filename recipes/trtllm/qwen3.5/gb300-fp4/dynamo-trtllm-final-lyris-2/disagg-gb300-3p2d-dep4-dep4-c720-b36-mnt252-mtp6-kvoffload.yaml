@@ -3,7 +3,8 @@
 # frontend installed from the mounted /dynamo_wheels (configs/install_dynamo_wheel.sh).
 # Dropped trtllm-serve-only settings: frontend process pools, per-conversation frontend affinity,
 # incremental tokenization, the ctx/gen routers, server_config_extra and engine perf-metrics output.
-# Frontend uses the Dynamo KV router with 14400 s session affinity.
+# Frontend uses the Dynamo KV router with 14400 s session affinity; decode workers advertise least-loaded
+# (DYN_ROUTER_MODE), matching the gen-side load balancing of the other recipes in this set.
 # Not yet measured under Dynamo.
 schema: 2
 name: disagg-gb300-3p2d-dep4-dep4-c720-b36-mnt252-mtp6-kvoffload-dynamo
@@ -71,6 +72,8 @@ roles:
       MIMALLOC_PURGE_DELAY: ''
       TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS: '3.80'
       DYN_ENGINE_CONV_AFFINITY: '1'
+      DYN_ROUTER_MODE: kv
+      DYN_ROUTER_SESSION_AFFINITY_TTL_SECS: '14400'
     args:
       attention_dp_config:
         kv_cache_routing_conversation_affinity: true
@@ -174,6 +177,7 @@ roles:
       MIMALLOC_PURGE_DELAY: ''
       TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS: '3.80'
       DYN_ENGINE_CONV_AFFINITY: '1'
+      DYN_ROUTER_MODE: least-loaded
     args:
       cache_transceiver_config:
         backend: NIXL
