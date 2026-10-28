@@ -301,7 +301,6 @@ def test_router_launch_uses_router_image_env_setup_and_captured_log() -> None:
     runtime = SimpleNamespace(
         log_dir=Path("/logs"),
         container_image=Path("/worker.sqsh"),
-        reuse_container=False,
         container_mounts={"/host": "/container"},
         environment={"GLOBAL": "value", "ROUTER_LOG": "info"},
         network_interface="ib0",
