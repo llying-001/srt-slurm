@@ -1,6 +1,6 @@
 # Dynamo counterpart of ../trtllm-serve-final-jhb-2/disagg-gb300-1p2d-tep4-tep8-c128-b16-mnt112-mtp6-kvoffload.yaml
 # Same image, topology, NUMA binding, engine args and worker env; dynamo.trtllm workers and the Dynamo
-# frontend installed from the mounted /dynamo_wheels (configs/install_dynamo_wheel.sh).
+# frontend installed from the ai-dynamo 1.6.0.dev20261010 wheels (dynamo.source.wheel).
 # Dropped trtllm-serve-only settings: frontend process pools, per-conversation frontend affinity,
 # incremental tokenization, the ctx/gen routers, server_config_extra and engine perf-metrics output.
 # Frontend uses the Dynamo KV router with 14400 s session affinity; gen_router load_balancing maps to least-loaded
@@ -19,12 +19,11 @@ identity:
     image: /scratch/fsw/portfolios/coreai/projects/coreai_comparch_inferencex/users/xiaomingc/qwen35_e2e/images/nvidia+tensorrt-llm+release+1.4.0rc2.dev202610210802+pr20815r3-481e06cca.sqsh
   frameworks:
     tensorrt_llm: 1.4.0rc2.dev202610210802
-    dynamo: 1.7.0.dev20261027
+    dynamo: 1.6.0.dev20261010
 slurm:
   time_limit: 04:00:00
 extra_mount:
 - /lustre:/lustre
-- /lustre/fsw/coreai_comparch_inferencex/rihuo/dynamo_wheels:/dynamo_wheels
 health_check:
   max_attempts: 540
   interval_seconds: 10
@@ -332,9 +331,10 @@ benchmark:
       --slice-duration 1.0 \
       --stats-interval 30 \
       --trace-idle-gap-cap-seconds 300
-setup_script: install_dynamo_wheel.sh
 dynamo:
-  install: false
+  install: true
+  source:
+    wheel: 1.6.0.dev20261010
 observability:
   enable_otel: false
 services:
